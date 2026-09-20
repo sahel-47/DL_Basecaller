@@ -90,7 +90,6 @@ QuantizedTransformerEncoderConfig = {
     "ROPE_Q_QUANTIZER" : set_quantizer('activations', 8),
     "ROPE_K_QUANTIZER" : set_quantizer('activations', 8),
     "V_QUANTIZER" : set_quantizer('activations', 8),
-    ### ADD QKT input quantizers
     "QKT_OP_QUANTIZER" : set_quantizer('activations', 8),
     "SOFTMAX_OP_QUANTIZER" : set_quantizer('activations', 8),
     "WV_OP_QUANTIZER" : set_quantizer('activations', 8),
