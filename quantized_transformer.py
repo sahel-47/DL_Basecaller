@@ -17,7 +17,7 @@ quant_configs_dict = {}
 
 def save_quant_config(quant_config):
     name = quant_config.__name__.lower()
-    pattern = r"(weights|activations)\d+"
+    pattern = r"(weights|activations|softmax)\d+"
     match = re.match(pattern, name)
     if match:
         key_name = match.group(0)
@@ -37,7 +37,7 @@ class WeightsQuantizer(WeightQuantSolver):
     float_to_int_impl_type = FloatToIntImplType.ROUND
     scaling_stats_op = StatsOp.MAX 
     restrict_scaling_type = RestrictValueType.FP 
-    scaling_per_output_channel = False 
+    scaling_per_output_channel = False  # Should be False 
     zero_point_impl = ZeroZeroPoint
     bit_width = 8
     signed = True 
@@ -49,11 +49,11 @@ class ActivationsQuantizer(ActQuantSolver):
     quant_type = QuantType.INT
     bit_width_impl_type = BitWidthImplType.CONST 
     float_to_int_impl_type = FloatToIntImplType.ROUND 
-    scaling_stats_op = StatsOp.PERCENTILE
-    high_percentile_q = 99.9
+    scaling_stats_op = StatsOp.MAX
+    # high_percentile_q = 99.9
     collect_stats_steps = 300 
     restrict_scaling_type = RestrictValueType.FP 
-    scaling_per_output_channel = False 
+    scaling_per_output_channel = False # Should be False 
     zero_point_impl = ZeroZeroPoint
     bit_width = 8
     signed = True 
@@ -69,6 +69,10 @@ class Weights4bitQuantizer(WeightsQuantizer):
     bit_width = 4
 
 @save_quant_config
+class Weights16bitQuantizer(WeightsQuantizer):
+    bit_width =16
+
+@save_quant_config
 class Activations8bitQuantizer(ActivationsQuantizer):
     bit_width = 8
 
@@ -80,7 +84,50 @@ class Activations4bitQuantizer(ActivationsQuantizer):
 class Activations32bitQuantizer(ActivationsQuantizer):
     bit_width = 32
 
+@save_quant_config
+class Activations16bitQuantizer(ActivationsQuantizer):
+    bit_width = 16
 
+@save_quant_config
+class SoftMax8bitQuantizer(ActivationsQuantizer):
+    quant_type = QuantType.INT
+    bit_width_impl_type = BitWidthImplType.CONST
+    float_to_int_impl_type = FloatToIntImplType.ROUND
+    restrict_scaling_type = RestrictValueType.FP
+    scaling_impl_type = ScalingImplType.CONST
+    scaling_init = 1.0                         # Dynamic range [0.0, 1.0]; Brevitas scale = 1.0 / 127
+    scaling_per_output_channel = False
+    zero_point_impl = ZeroZeroPoint
+    bit_width = 8
+    signed = True                             # Range [0, 127] fits into signed ap_int<8>
+    narrow_range = False
+
+
+    # quant_type = QuantType.INT
+    # bit_width_impl_type = BitWidthImplType.CONST
+    # float_to_int_impl_type = FloatToIntImplType.ROUND
+    # restrict_scaling_type = RestrictValueType.FP
+    # scaling_impl_type = ScalingImplType.CONST
+    # scaling_init = 1.0
+    # scaling_per_output_channel = False
+    # zero_point_impl = ZeroZeroPoint
+    # bit_width = 8
+    # signed = True
+    # narrow_range = False
+
+    # quant_type = QuantType.INT
+    # bit_width_impl_type = BitWidthImplType.CONST
+    # float_to_int_impl_type = FloatToIntImplType.ROUND
+    # scaling_stats_op = StatsOp.PERCENTILE
+    # high_percentile_q = 99.9
+    # collect_stats_steps = 300
+    # restrict_scaling_type = RestrictValueType.FP
+    # scaling_per_output_channel = False
+    # zero_point_impl = ZeroZeroPoint
+    # bit_width = 8
+    # signed = False          # <-- probabilities are non-negative
+    # narrow_range = False
+    # scaling_impl_type = ScalingImplType.PARAMETER_FROM_STATS   # <-- calibrated, not a fixed constant
 
 QuantizedTransformerEncoderConfig = {
     "MHA_INPUT_QUANTIZER" : set_quantizer('activations', 8),
@@ -90,15 +137,16 @@ QuantizedTransformerEncoderConfig = {
     "ROPE_Q_QUANTIZER" : set_quantizer('activations', 8),
     "ROPE_K_QUANTIZER" : set_quantizer('activations', 8),
     "V_QUANTIZER" : set_quantizer('activations', 8),
+    ### ADD QKT input quantizers
     "QKT_OP_QUANTIZER" : set_quantizer('activations', 8),
-    "SOFTMAX_OP_QUANTIZER" : set_quantizer('activations', 8),
+    "SOFTMAX_OP_QUANTIZER" : set_quantizer('softmax', 8),
     "WV_OP_QUANTIZER" : set_quantizer('activations', 8),
     "WO_PROJ" : set_quantizer('weights', 8),
     "WUP_PROJ" : set_quantizer('weights', 8),
     "WGATE_PROJ" : set_quantizer('weights', 8),
     "WDOWN_PROJ" : set_quantizer('weights', 8),
     "SWIGLU_ELEMENTWISE_OP_QUANTIZER" : set_quantizer('activations', 8),
-    "RMS_INPUT_QUANTIZER" : set_quantizer('activations', 32),
+    "RMS_INPUT_QUANTIZER" : set_quantizer('activations', 8),
     "RMS_OUTPUT_QUANTIZER" : set_quantizer('activations', 8)
 }
 
@@ -112,13 +160,17 @@ class RoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq.detach(), persistent=False)
 
     def rotate_half(self, x):
+        if hasattr(x, 'value'):
+            x = x.value
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x):
+        if hasattr(x, 'value'):
+            x = x.value
         batch, seqlen, nheads, headdim = x.shape
 
-        pos = torch.arange(0, seqlen, device = x.device, dtype= x.dtype)
+        pos = torch.arange(0, seqlen, device = x.device, dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", pos, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()[None, :, None, :]
@@ -127,6 +179,8 @@ class RoPE(nn.Module):
         x = x * cos + self.rotate_half(x) * sin
 
         return x
+
+    
 @register
 class InitialTransformerEncoderBlockQuantizer(nn.Module):
     def  __init__(self):
@@ -156,10 +210,10 @@ class QuantizedMultiHeadAttention(nn.Module):
 
         self.Wqkv_bias_quant = None if not qkv_bias else Int32Bias
 
-        #QKV quantized weights
-        self.Wq = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WQ_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=True)
-        self.Wk = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WK_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=True)
-        self.Wv = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WV_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=True)
+        #QKV quantized weights-- They all feed into RoPE ... there is no need to return quant tensor
+        self.Wq = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WQ_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=False)
+        self.Wk = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WK_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=False)
+        self.Wv = qnn.QuantLinear(d_model, d_model, qkv_bias, weight_quant=QuantizedTransformerEncoderConfig["WV_PROJ"], bias_quant=self.Wqkv_bias_quant, return_quant_tensor=False)
 
         #RoPE output quantizer
         self.rope_q_quantize = qnn.QuantIdentity(act_quant=QuantizedTransformerEncoderConfig["ROPE_Q_QUANTIZER"], return_quant_tensor=True)
@@ -174,19 +228,29 @@ class QuantizedMultiHeadAttention(nn.Module):
         self.Wo_bias_quant = None if not out_bias else Int32Bias
 
         ### WO_proj_weights
-        self.out_proj = qnn.QuantLinear(d_model, d_model, bias = out_bias, weight_quant=QuantizedTransformerEncoderConfig["WO_PROJ"], bias_quant= self.Wo_bias_quant, return_quant_tensor=True)
+        self.out_proj = qnn.QuantLinear(d_model, d_model, bias = out_bias, weight_quant=QuantizedTransformerEncoderConfig["WO_PROJ"], bias_quant= self.Wo_bias_quant, return_quant_tensor=False)
 
 
 
     
     def attention_engine(self, q, k, v, mask):
-        scores = (q @ k.transpose(-2,-1))/math.sqrt(self.head_dim)
+
+        q_val = q.value if hasattr(q, "value") else q
+        k_val = k.value if hasattr(k, "value") else k
+        scores = torch.matmul(q_val, k_val.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
         quantized_scores = self.QKT_op_quantizer(scores)
+        quantized_scores_val = quantized_scores.value if hasattr(quantized_scores, "value") else quantized_scores
         # QuantIdentity here
-        masked_scores = quantized_scores.masked_fill(~mask, -100000.0)
+        masked_scores = quantized_scores_val.masked_fill(~mask, -100000.0)
         probs = torch.softmax(masked_scores, dim=-1)
         quantized_probs =self.Softmax_op_quantizer(probs)
-        WV = quantized_probs @ v 
+
+        quantized_probs_val = quantized_probs.value if hasattr(quantized_probs, "value") else quantized_probs
+        v_val = v.value if hasattr(v, "value") else v
+        WV = torch.matmul(quantized_probs_val,v_val)
+        N, nhead, T, head_dim = WV.shape
+        WV = WV.transpose(1, 2).contiguous().view(N, T, self.d_model)
         WV_op = self.WV_op_quantizer(WV)
         return WV_op
 
@@ -198,7 +262,7 @@ class QuantizedMultiHeadAttention(nn.Module):
         k_proj = self.Wk(q_x)
         v_proj = self.Wv(q_x)
 
-        q_proj = q_proj.view(N, T, self.nhead, self.head_dim)
+        q_proj = q_proj.view(N, T, self.nhead, self.head_dim) #standard torch tensors
         k_proj = k_proj.view(N, T, self.nhead, self.head_dim)   
         v_proj = v_proj.view(N, T, self.nhead, self.head_dim)
 
@@ -206,15 +270,20 @@ class QuantizedMultiHeadAttention(nn.Module):
         rotated_q = self.rotary_emb(q_proj)
         rotated_k = self.rotary_emb(k_proj)
 
-        q_rotated_q  = self.rope_q_quantize(rotated_q).transpose(1, 2)
-        q_rotated_k  = self.rope_k_quantize(rotated_k).transpose(1, 2)
-        q_v = self.v_quantize(v_proj).transpose(1, 2)
+        rotated_q = rotated_q.transpose(1,2)
+        rotated_k = rotated_k.transpose(1,2)
+        v_proj = v_proj.transpose(1,2)
+
+
+        q_rotated_q  = self.rope_q_quantize(rotated_q)
+        q_rotated_k  = self.rope_k_quantize(rotated_k)
+        q_v = self.v_quantize(v_proj)
 
 
         mask = sliding_window_mask(T, self.attn_window, q_x.device)
 
         q_attn_op = self.attention_engine(q_rotated_q, q_rotated_k, q_v, mask = mask)
-        q_attn_op = q_attn_op.transpose(1, 2).contiguous().view(N, T, self.d_model)
+
 
         out = self.out_proj(q_attn_op)
 
@@ -228,9 +297,9 @@ class QuantizedSwiGLU(nn.Module):
         self.Wgate_bias = None if not bias else Int32Bias
         self.Wdown_bias = None if not bias else Int32Bias
 
-        self.Wup =  qnn.QuantLinear(in_features, hidden_features, bias=bias, weight_quant=QuantizedTransformerEncoderConfig["WUP_PROJ"],bias_quant=self.Wup_bias, return_quant_tensor=True)
-        self.Wgate = qnn.QuantLinear(in_features, hidden_features, bias=bias , weight_quant=QuantizedTransformerEncoderConfig["WGATE_PROJ"], bias_quant=self.Wgate_bias, return_quant_tensor=True)
-        self.Wdown = qnn.QuantLinear(hidden_features, in_features, bias=bias, weight_quant=QuantizedTransformerEncoderConfig["WDOWN_PROJ"], bias_quant=self.Wdown_bias,  return_quant_tensor=True)
+        self.Wup =  qnn.QuantLinear(in_features, hidden_features, bias=bias, weight_quant=QuantizedTransformerEncoderConfig["WUP_PROJ"],bias_quant=self.Wup_bias, return_quant_tensor=False)
+        self.Wgate = qnn.QuantLinear(in_features, hidden_features, bias=bias , weight_quant=QuantizedTransformerEncoderConfig["WGATE_PROJ"], bias_quant=self.Wgate_bias, return_quant_tensor=False)
+        self.Wdown = qnn.QuantLinear(hidden_features, in_features, bias=bias, weight_quant=QuantizedTransformerEncoderConfig["WDOWN_PROJ"], bias_quant=self.Wdown_bias,  return_quant_tensor=False)
         self.swiglu_quantize = qnn.QuantIdentity(act_quant=QuantizedTransformerEncoderConfig["SWIGLU_ELEMENTWISE_OP_QUANTIZER"], return_quant_tensor=True)
         # self.down_proj_quantize = qnn.QuantIdentity(act_quant=QuantizedTransformerEncoderConfig["WDOWN_OP_QUANTIZER"], return_quant_tensor=True)
 
@@ -286,7 +355,7 @@ class QuantizedTransformerEncoderLayer(nn.Module):
             "attn_window" : attn_window
         }
 
-        self.multihead_attention_input_quantizer = qnn.QuantIdentity(act_quant=QuantizedTransformerEncoderConfig["MHA_INPUT_QUANTIZER"], return_quant_tensor=True)
+        # self.multihead_attention_input_quantizer = qnn.QuantIdentity(act_quant=QuantizedTransformerEncoderConfig["MHA_INPUT_QUANTIZER"], return_quant_tensor=True)
         self.self_attn = QuantizedMultiHeadAttention(d_model, nhead, attn_window=attn_window)
         self.ff = QuantizedSwiGLU(d_model, hidden_features=dim_feedforward)
         self.norm1 = QuantizedRMSNorm(d_model)
@@ -316,7 +385,6 @@ class QuantizedTransformerEncoderLayer(nn.Module):
         encoder_block_op = self.rms2_out_quantizer(self.norm2(residual2)) 
         return encoder_block_op
         
-
 
 def sliding_window_mask(seq_len, window, device):
     band = torch.full((seq_len, seq_len), fill_value=1.0)
